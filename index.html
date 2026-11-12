@@ -175,8 +175,9 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border:0;border-radiu
     <h3>Fit <em>Auto</em></h3>
     <div class="row"><label>Size</label><output data-o="size"></output><input type="range" data-k="size" min=".8" max="1.25" step=".005"></div>
     <div class="row"><label>Depth</label><output data-o="depth"></output><input type="range" data-k="depth" min="-.3" max=".3" step=".005"></div>
+    <div class="row"><label>Tilt</label><output data-o="tilt"></output><input type="range" data-k="tilt" min="-25" max="25" step=".5"></div>
     <div class="row"><label>Lift</label><output data-o="lift"></output><input type="range" data-k="lift" min="-.2" max=".2" step=".005"></div>
-    <div class="inline"><span class="mono dim">Fitted from 478 landmarks</span><button class="ghostbtn" id="bReset">Reset</button></div>
+    <div class="inline"><span class="mono dim">Pose solved from 478 landmarks</span><button class="ghostbtn" id="bReset">Reset</button></div>
   </section>
   <section>
     <p class="note" style="margin:0">Anatomy of one adult, fitted to your tracked landmarks. Typical placement, not a scan of you. Not a medical tool.<br><br>Models: BodyParts3D, © 2008 Life Science Integrated Database Center, CC BY-SA 2.1 JP; decimated and re-aligned. Tracking: MediaPipe. Rendering: three.js.<br><br>H hide UI · Space plate · R rec · S sweep</p>
@@ -200,7 +201,7 @@ const video = $('#vid');
 const tmp = document.createElement('canvas'), tctx = tmp.getContext('2d');
 const glc = document.createElement('canvas');
 
-const DEF = { exposure: 1, reality: .35, feather: .35, cut: 0, lens: 170, size: 1, depth: 0, lift: 0 };
+const DEF = { exposure: 1, reality: .35, feather: .35, cut: 0, lens: 170, size: 1, depth: 0, lift: 0, tilt: 0 };
 const S = {
   layers: { skull: true, teeth: true, brain: false, eyes: true, spine: true, hands: true, tissue: false, labels: true },
   look: 'film', reveal: 'whole', grain: true, lensAuto: true, v: { ...DEF }
@@ -382,12 +383,21 @@ function updateHead(now) {
   if (!lm) { head.visible = now - HS.seen < 300; if (now - HS.seen > 800) HS.init = false; return; }
   HS.seen = now; head.visible = true;
   const pL = P(lm[234]), pR = P(lm[454]), pT = P(lm[10]), pC = P(lm[152]), pN = P(lm[168]);
-  const xr = pR.clone().sub(pL), s = xr.length(), yr = pT.clone().sub(pC);
-  const z = new THREE.Vector3().crossVectors(xr, yr).normalize();
-  if (z.z < 0) { xr.negate(); z.negate(); }
-  const x = xr.normalize(), y = new THREE.Vector3().crossVectors(z, x).normalize();
+  // Orientation: facing direction from MediaPipe's solved head pose (all 478 points),
+  // up from forehead→chin. Landmark depth alone is too noisy for rotation.
+  const yr = pT.clone().sub(pC), mat = faceRes.facialTransformationMatrixes?.[0]?.data;
+  let z;
+  if (mat) z = V((mirror ? -1 : 1) * mat[8], mat[9], mat[10]).normalize();
+  else { const a = pR.clone().sub(pL), b = yr.clone(); a.z *= .35; b.z *= .35; z = new THREE.Vector3().crossVectors(a, b).normalize(); }
+  if (z.z < 0) z.negate();
+  const tilt = S.v.tilt * Math.PI / 180;
+  const y = yr.clone().addScaledVector(z, -yr.dot(z)).normalize();
+  const x = new THREE.Vector3().crossVectors(y, z).normalize();
+  if (tilt) { const qt = new THREE.Quaternion().setFromAxisAngle(x, tilt); y.applyQuaternion(qt); z.applyQuaternion(qt); }
   tq.setFromRotationMatrix(tmpM.makeBasis(x, y, z));
-  const sc = s * S.v.size;
+  // Size: on-screen face width, corrected for how much the face-width axis is foreshortened
+  const w2 = Math.hypot(pR.x - pL.x, pR.y - pL.y), xp = Math.max(.45, Math.hypot(x.x, x.y));
+  const sc = (w2 / xp) * S.v.size;
   const tp = pN.clone().addScaledVector(z, (-.05 + S.v.depth) * sc).addScaledVector(y, S.v.lift * sc);
   if (!HS.init) { HS.pos.copy(tp); HS.q.copy(tq); HS.s = sc; HS.init = true; }
   else { HS.pos.lerp(tp, .55); HS.q.slerp(tq, .5); HS.s += (sc - HS.s) * .35; }
@@ -640,7 +650,7 @@ async function loadModels() {
   const make = (Cls, url, opts, delegate) => Cls.createFromOptions(fs, { baseOptions: { modelAssetPath: url, delegate }, runningMode: 'VIDEO', ...opts });
   const both = async (Cls, url, opts) => { try { return await make(Cls, url, opts, 'GPU'); } catch (e) { return await make(Cls, url, opts, 'CPU'); } };
   [face, hands] = await Promise.all([
-    both(FaceLandmarker, FACE_URL, { numFaces: 1, outputFaceBlendshapes: true, minFacePresenceConfidence: .5, minTrackingConfidence: .5 }),
+    both(FaceLandmarker, FACE_URL, { numFaces: 1, outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true, minFacePresenceConfidence: .5, minTrackingConfidence: .5 }),
     both(HandLandmarker, HAND_URL, { numHands: 2, minHandPresenceConfidence: .5, minTrackingConfidence: .5 })
   ]);
   const T = FaceLandmarker.FACE_LANDMARKS_TESSELATION || [];
@@ -692,7 +702,7 @@ function bindUI() {
   document.querySelectorAll('input[data-k]').forEach(inp => { inp.oninput = () => { S.v[inp.dataset.k] = +inp.value; syncOut(); if (inp.dataset.k === 'lens') { S.lensAuto = false; document.querySelector('[data-flag=lensAuto]').setAttribute('aria-pressed', false); } }; });
   syncInputs(); setSeg('look', S.look); setSeg('reveal', S.reveal);
 }
-const FMT = { exposure: v => v.toFixed(2), reality: v => Math.round(v * 100) + '%', feather: v => Math.round(v * 100) + '%', cut: v => (v >= 0 ? '+' : '') + v.toFixed(2), lens: v => Math.round(v) + 'px', size: v => Math.round(v * 100) + '%', depth: v => (v >= 0 ? '+' : '') + v.toFixed(2), lift: v => (v >= 0 ? '+' : '') + v.toFixed(2) };
+const FMT = { exposure: v => v.toFixed(2), reality: v => Math.round(v * 100) + '%', feather: v => Math.round(v * 100) + '%', cut: v => (v >= 0 ? '+' : '') + v.toFixed(2), lens: v => Math.round(v) + 'px', size: v => Math.round(v * 100) + '%', depth: v => (v >= 0 ? '+' : '') + v.toFixed(2), lift: v => (v >= 0 ? '+' : '') + v.toFixed(2), tilt: v => (v >= 0 ? '+' : '') + v.toFixed(1) + '°' };
 function syncOut() { document.querySelectorAll('output[data-o]').forEach(o => o.textContent = FMT[o.dataset.o](S.v[o.dataset.o])); }
 function syncInputs() { document.querySelectorAll('input[data-k]').forEach(i => i.value = S.v[i.dataset.k]); syncOut(); }
 function setSeg(key, val) {
@@ -700,7 +710,7 @@ function setSeg(key, val) {
   document.querySelectorAll(`.seg[data-key=${key}] button`).forEach(b => b.setAttribute('aria-pressed', b.dataset.val === val));
   if (key === 'look') allMeshes.forEach(m => m.material = val === 'solid' ? m.userData.s : m.userData.x);
 }
-$('#bReset').onclick = () => { S.v.size = 1; S.v.depth = 0; S.v.lift = 0; syncInputs(); toast('Fit reset'); };
+$('#bReset').onclick = () => { S.v.size = 1; S.v.depth = 0; S.v.lift = 0; S.v.tilt = 0; syncInputs(); toast('Fit reset'); };
 
 let toastT;
 function toast(t) { const el = $('#toast'); el.textContent = t; el.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove('show'), 1600); }
